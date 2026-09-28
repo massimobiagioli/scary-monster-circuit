@@ -1,0 +1,13 @@
+# Rust
+/firmware/target/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated schematics pictures
+schematics/images/
+
+# macOS
+.DS_Store

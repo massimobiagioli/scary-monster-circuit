@@ -1,0 +1,2 @@
+markdown==3.6
+xhtml2pdf==0.2.16

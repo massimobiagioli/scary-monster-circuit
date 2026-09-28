@@ -1,0 +1,31 @@
+[package]
+name = "scary-monster-firmware"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[lib]
+name = "scary_monster_lib"
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "scary-monster-firmware"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+embedded-hal = "1.0"
+embedded-io = "0.6"
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-halt = "0.2"
+rp-pico = "0.9"
+
+[profile.release]
+opt-level = "s"
+lto = true
+debug = 2
