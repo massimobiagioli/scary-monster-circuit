@@ -246,6 +246,7 @@ impl SensorRig {
 struct PwmState {
     duty: Option<u16>,
     fail: bool,
+    writes: u32,
 }
 
 /// A readable handle on the state of a mocked PWM channel.
@@ -256,6 +257,11 @@ impl PwmHandle {
     /// The duty cycle the channel was last set to.
     pub fn duty(&self) -> Option<u16> {
         self.0.borrow().duty
+    }
+
+    /// How many times the duty cycle was written.
+    pub fn writes(&self) -> u32 {
+        self.0.borrow().writes
     }
 
     /// Makes every duty cycle update fail.
@@ -285,6 +291,7 @@ impl SetDutyCycle for TestPwm {
             return Err(PwmError);
         }
         state.duty = Some(duty);
+        state.writes += 1;
         Ok(())
     }
 }

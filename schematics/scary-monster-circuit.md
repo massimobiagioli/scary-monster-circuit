@@ -77,25 +77,32 @@ electricity has no way back.
 
 ## 5. How the brain decides: the state machine
 
-The brain is always in one of three "moods", called states. This picture shows
+The brain is always in one of four "moods", called states. This picture shows
 how it moves from one mood to another. Read the arrows as "when this happens,
 change mood".
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Follow: someone is closer than 100 cm
-    Follow --> Idle: nobody is within 100 cm
-    Follow --> Action: someone is closer than 30 cm
-    Action --> Follow: the person steps back
-    Action --> Idle: nobody is within 100 cm
+    Idle --> Follow: one eye sees someone closer than 30 cm
+    Follow --> Idle: nobody is within 40 cm
+    Follow --> Action: both eyes see someone closer than 10 cm
+    Action --> PostAction: the song has played (~10 s)
+    PostAction --> Follow: the person steps back past 10 cm
+    PostAction --> Idle: nobody is within 40 cm
 ```
 
 What each mood means:
 
 - **Idle** — the monster is waiting. The head looks straight ahead.
-- **Follow** — someone is within 100 cm, so the head turns towards them.
-- **Action** — someone is within 30 cm, so the song starts. Very scary!
+- **Follow** — one eye sees someone closer than 30 cm, so the head turns towards
+  them. It keeps following until they step past 40 cm: that little gap (30 vs
+  40) stops the head from wiggling when someone stands right at the edge.
+- **Action** — **both** eyes see someone closer than 10 cm, so the song starts
+  and plays for about 10 seconds. Very scary!
+- **PostAction** — the song has just played. The head keeps following the
+  person, but the monster will not play again until they step away (past 10 cm)
+  and come back.
 
 ## 6. Step-by-step build
 

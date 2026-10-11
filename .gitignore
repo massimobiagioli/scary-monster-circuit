@@ -6,6 +6,10 @@
 __pycache__/
 *.pyc
 
+# Project-local tool installations
+tools/probe-rs/.cargo-home/
+tools/elf2uf2-rs/.cargo-home/
+
 # Generated schematics pictures
 schematics/images/
 

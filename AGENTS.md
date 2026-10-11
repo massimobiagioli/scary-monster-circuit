@@ -44,8 +44,8 @@ the `skill` tool:
 ## Tooling
 
 The `Makefile` is the single entry point for build tasks (`make help` lists all
-targets): `upload-firmware`, `logs`, `test`, `coverage`, `lint`, `lint-fix`,
-`schematics`.
+targets): `build`, `upload-firmware`, `logs`, `probe`, `test`, `coverage`,
+`lint`, `lint-fix`, `schematics`.
 
 - `tools/md2pdf` — reusable Markdown-to-PDF tool. Always use it to build
   schematic PDFs; never convert documents by hand.
@@ -58,6 +58,9 @@ targets): `upload-firmware`, `logs`, `test`, `coverage`, `lint`, `lint-fix`,
   an ADR at `docs/adr/adr-<adr-id>.md` and update the registry
   `docs/adr/index.md`.
 - **Never install software with Homebrew.** Use project-local tooling instead.
+- **Never install Rust tools with a bare `cargo install`.** Pin the version and
+  install it into a project-local root under `tools/` (see
+  `tools/probe-rs/` and `docs/adr/adr-0009.md`).
 - **Any Python tooling MUST run inside its own `.venv`** (see `docs/STACK.md`).
 - Keep docs in sync with the code whenever behavior changes.
 - Follow the principles in `docs/PRINCIPLES.md` for all code changes.

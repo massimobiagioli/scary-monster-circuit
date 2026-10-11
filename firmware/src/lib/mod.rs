@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod controller;
+pub mod probe;
 pub mod sensor;
 pub mod servo;
 pub mod state_machine;

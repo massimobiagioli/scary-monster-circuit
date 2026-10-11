@@ -1,26 +1,37 @@
 .DEFAULT_GOAL := help
 
 CARGO    ?= cargo
-CHIP     ?= RP2040
+ELF2UF2  ?= tools/elf2uf2-rs/elf2uf2-rs
 FIRMWARE ?= firmware
+ELF      = $(FIRMWARE)/target/thumbv6m-none-eabi/release/scary-monster-firmware
 HOST     := $(shell rustc -vV | sed -n 's/host: //p')
 LLVM_BIN := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
 
 SCHEMATICS := $(wildcard schematics/*.md)
 SCHEMATICS_PDF := $(SCHEMATICS:.md=.pdf)
 
-.PHONY: help upload-firmware logs test lint lint-fix coverage schematics breadboard-images
+.PHONY: help build upload-firmware logs probe test lint lint-fix coverage schematics breadboard-images
 
 help: ## Show this help
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-upload-firmware: ## Build and flash the firmware onto the device
-	cd $(FIRMWARE) && $(CARGO) run --release
+build: ## Build the release firmware
+	cd $(FIRMWARE) && $(CARGO) build --release
 
-logs: ## Open the device logs over RTT
-	probe-rs attach --chip $(CHIP)
+upload-firmware: build ## Build and flash the firmware over USB (BOOTSEL)
+	@echo "Put the Pico in BOOTSEL mode: hold the BOOTSEL button while plugging the USB cable."
+	$(ELF2UF2) -d $(ELF)
+
+logs: ## Stream the live dashboard over USB serial
+	@tools/logs/logs
+
+probe: ## Build, flash, and stream the live dashboard over USB serial
+	@echo "Put the Pico in BOOTSEL mode: hold the BOOTSEL button while plugging the USB cable."
+	@$(MAKE) --no-print-directory build
+	$(ELF2UF2) -d $(ELF)
+	@tools/logs/logs
 
 test: ## Run the unit tests on the host
 	cd $(FIRMWARE) && $(CARGO) test --lib --target $(HOST)

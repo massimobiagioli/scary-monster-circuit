@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run a project-local, version-pinned elf2uf2-rs.
+#
+# On first use it installs the pinned version (see version.txt) into a local
+# root, tools/elf2uf2-rs/.cargo-home, so nothing is installed globally and the
+# tool is reproducible. Used to flash the Pico over USB in BOOTSEL mode, without
+# a debug probe. Mirrors tools/probe-rs and the Python tool wrappers.
+#
+# Usage: tools/elf2uf2-rs/elf2uf2-rs <elf2uf2-rs args...>
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$DIR/.cargo-home"
+BIN="$ROOT/bin/elf2uf2-rs"
+VERSION="$(cat "$DIR/version.txt")"
+CARGO="${CARGO:-cargo}"
+
+if [ ! -x "$BIN" ]; then
+    echo "installing elf2uf2-rs $VERSION into $ROOT" >&2
+    "$CARGO" install --locked --version "$VERSION" --root "$ROOT" elf2uf2-rs
+fi
+
+exec "$BIN" "$@"

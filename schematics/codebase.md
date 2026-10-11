@@ -94,17 +94,18 @@ embedded-io = "0.6"
 [target.'cfg(target_arch = "arm")'.dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-defmt = "0.3"
-defmt-rtt = "0.4"
 panic-halt = "0.2"
 rp-pico = "0.9"
+usb-device = "0.3"
+usbd-serial = "0.2"
 ```
 
 - These helpers are only for the **Pico** (an ARM chip), not for a normal
   computer. That is why they are under the "arm only" section.
 - `cortex-m-rt` starts our program on the chip.
 - `panic-halt` says "if something goes very wrong, just stop" (safe for a prop).
-- `defmt` + `defmt-rtt` let us print little log messages.
+- `usb-device` + `usbd-serial` make the Pico appear to the computer as a USB
+  serial port, so it can print log messages over the same USB cable.
 - `rp-pico` knows all the Pico's parts.
 
 ```toml
@@ -157,16 +158,28 @@ before building.
 MEMORY
 {
     BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
-    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K
+    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100
     RAM   : ORIGIN = 0x20000000, LENGTH = 264K
 }
+
+EXTERN(BOOT2_FIRMWARE)
+
+SECTIONS
+{
+    .boot2 ORIGIN(BOOT2) :
+    {
+        KEEP(*(.boot2));
+    } > BOOT2
+} INSERT BEFORE .text;
 ```
 
 - This tells the linker where things live on the chip.
 - `BOOT2` is a tiny 256-byte area (`0x100`) at the very start of flash that
-  helps the chip start.
-- `FLASH` is the big program storage: 2048K (2 megabytes) starting right after
-  the boot area.
+  helps the chip start. The little `SECTIONS` block puts the boot code there: the
+  chip jumps to the very beginning of flash when it powers on, so without it our
+  program would never run.
+- `FLASH` is the big program storage: 2048K minus the boot area, starting right
+  after it.
 - `RAM` is the fast working memory: 264K starting at `0x20000000`.
 
 ### 2.4 `.cargo/config.toml` — how to build and run
@@ -181,26 +194,17 @@ target = "thumbv6m-none-eabi"
 
 ```toml
 [target.thumbv6m-none-eabi]
-runner = "probe-rs run --chip RP2040"
+runner = "../tools/probe-rs/probe-rs run --chip RP2040"
 rustflags = [
     "-C",
     "link-arg=-Tlink.x",
-    "-C",
-    "link-arg=-Tdefmt.x",
 ]
 ```
 
-- `runner` is the program used to send the code to the Pico (`probe-rs`).
+- `runner` is only used by `cargo run` to flash over SWD with a debug probe. The
+  normal way to flash is over USB with `make upload-firmware`.
 - `rustflags` are extra instructions for the linker:
-  - `-Tlink.x` uses the memory map,
-  - `-Tdefmt.x` sets up the log system.
-
-```toml
-[env]
-DEFMT_LOG = "info"
-```
-
-- `DEFMT_LOG = "info"` says "show me the normal log messages".
+  - `-Tlink.x` uses the memory map.
 
 ## 3. The brain: `src/lib/mod.rs`
 
@@ -228,30 +232,39 @@ pub mod state_machine;
 ```rust
 //! Behavior finite state machine.
 //!
-//! The prop has exactly three states. The next state is a pure function of the
-//! nearest distance reported by the two side sensors, which keeps the logic
-//! small and easy to test.
+//! The prop has four states. Apart from `Action`, which lasts a fixed number of
+//! ticks so the scary song can finish, the next state is a function of the two
+//! side sensors.
 ```
 
 - Lines starting with `//!` are notes that describe the whole file. They are not
   instructions; they are for humans.
 
-### 4.2 The three important numbers
+### 4.2 The important numbers
 
 ```rust
-pub const FOLLOW_DISTANCE_CM: u16 = 100;
-pub const ACTION_DISTANCE_CM: u16 = 30;
+pub const FOLLOW_DISTANCE_CM: u16 = 30;
+pub const FOLLOW_EXIT_CM: u16 = 40;
+pub const ACTION_DISTANCE_CM: u16 = 10;
 pub const TURN_DEADBAND_CM: u16 = 10;
+pub const ACTION_DURATION_TICKS: u32 = 200;
 ```
 
 - `const` means a fixed number that never changes.
-- `FOLLOW_DISTANCE_CM` = 100: if someone is closer than 100 cm, follow them.
-- `ACTION_DISTANCE_CM` = 30: if someone is closer than 30 cm, play the song.
+- `FOLLOW_DISTANCE_CM` = 30: if the **nearest** sensor sees someone closer than
+  30 cm, follow them (one sensor is enough).
+- `ACTION_DISTANCE_CM` = 10: if **both** sensors see someone closer than 10 cm,
+  play the song.
 - `TURN_DEADBAND_CM` = 10: ignore differences smaller than 10 cm, so the head
   does not wobble.
+- `ACTION_DURATION_TICKS` = 200: the song lasts about 200 little steps (roughly
+  10 seconds), so the mood does not jump around while it plays.
+- `FOLLOW_EXIT_CM` = 40: `Follow` starts at 30 cm but only ends past 40 cm. The
+  gap is **hysteresis**, so a reading that wobbles around 30 cm does not flicker
+  the mood — and the head — on and off.
 - `u16` means "a whole number from 0 to 65535".
 
-### 4.3 The three moods
+### 4.3 The four moods
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -259,16 +272,21 @@ pub enum State {
     /// Waiting; nothing is within range.
     #[default]
     Idle,
-    /// A person is within `FOLLOW_DISTANCE_CM`; follow their movement.
+    /// The nearest person is within `FOLLOW_DISTANCE_CM`; follow them.
     Follow,
-    /// A person is within `ACTION_DISTANCE_CM`; play the scary song.
+    /// Both sensors see somebody within `ACTION_DISTANCE_CM`; play the song.
     Action,
+    /// The song has played; follow but do not trigger again until the person
+    /// leaves the action range.
+    PostAction,
 }
 ```
 
-- `enum` is a list of choices. Here the monster can only be in one of three
+- `enum` is a list of choices. Here the monster can only be in one of four
   moods.
-- `Idle` = waiting, `Follow` = following, `Action` = playing the song.
+- `Idle` = waiting, `Follow` = following, `Action` = playing the song,
+  `PostAction` = the song is over but the monster waits before it can play
+  again.
 - `#[derive(...)]` is a shortcut that asks Rust to create useful abilities for
   us: `Debug` (print it), `Clone`/`Copy` (can be duplicated), `PartialEq`/`Eq`
   (can be compared with `==`), and `Default`.
@@ -302,10 +320,18 @@ pub struct Reading {
 - `Option<u16>` means "maybe a number, maybe nothing". Nothing (`None`) means the
   sensor did not see anything. A number arrives as `Some(x)`.
 
-### 4.6 `nearest_cm()` — the closest person
+### 4.6 `nearest_cm()` and `both_within()` — what the two eyes see
 
 ```rust
 impl Reading {
+    /// Whether both sensors see something within `cm` centimetres.
+    pub fn both_within(&self, cm: u16) -> bool {
+        matches!(
+            (self.left_cm, self.right_cm),
+            (Some(left), Some(right)) if left <= cm && right <= cm
+        )
+    }
+
     /// The smallest valid distance across both sensors.
     pub fn nearest_cm(&self) -> Option<u16> {
         match (self.left_cm, self.right_cm) {
@@ -318,6 +344,8 @@ impl Reading {
 ```
 
 - `impl Reading` means "these are the abilities of a `Reading`".
+- `both_within(cm)` answers `true` only when **both** eyes see something at `cm`
+  or less. It is what starts the song when somebody is right in front.
 - `pub fn nearest_cm(&self)` is a function that looks at itself (`&self`) and
   answers the smallest distance.
 - `match (self.left_cm, self.right_cm)` looks at both eyes at once:
@@ -364,10 +392,12 @@ impl Reading {
 #[derive(Debug, Default)]
 pub struct StateMachine {
     state: State,
+    action_ticks: u32,
 }
 ```
 
-- A `StateMachine` is a box that remembers the **current** mood.
+- A `StateMachine` is a box that remembers the **current** mood and how many
+  ticks of the song are left (`action_ticks`).
 - `#[derive(Default)]` gives a starting value (which is `Idle`).
 
 ```rust
@@ -390,10 +420,49 @@ impl StateMachine {
 ```rust
     /// Advances the machine with a new sensor reading and returns the state.
     pub fn update(&mut self, reading: Reading) -> State {
-        self.state = match reading.nearest_cm() {
-            Some(distance) if distance <= ACTION_DISTANCE_CM => State::Action,
-            Some(distance) if distance <= FOLLOW_DISTANCE_CM => State::Follow,
-            _ => State::Idle,
+        let nearest = reading.nearest_cm();
+        let within_action = reading.both_within(ACTION_DISTANCE_CM);
+        let enter_follow = nearest.is_some_and(|distance| distance <= FOLLOW_DISTANCE_CM);
+        let keep_follow = nearest.is_some_and(|distance| distance <= FOLLOW_EXIT_CM);
+
+        self.state = match self.state {
+            State::Action => {
+                self.action_ticks = self.action_ticks.saturating_sub(1);
+                if self.action_ticks == 0 {
+                    State::PostAction
+                } else {
+                    State::Action
+                }
+            }
+            State::PostAction => {
+                if within_action {
+                    State::PostAction
+                } else if keep_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
+            State::Follow => {
+                if within_action {
+                    self.action_ticks = ACTION_DURATION_TICKS;
+                    State::Action
+                } else if keep_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
+            State::Idle => {
+                if within_action {
+                    self.action_ticks = ACTION_DURATION_TICKS;
+                    State::Action
+                } else if enter_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
         };
         self.state
     }
@@ -401,10 +470,20 @@ impl StateMachine {
 ```
 
 - `update(&mut self, ...)` is allowed to **change** the machine (`&mut`).
-- It looks at the nearest distance and picks a mood:
-  - 30 cm or less -> `Action`,
-  - 100 cm or less -> `Follow`,
-  - anything else (including "nothing seen") -> `Idle`.
+- `within_action` is true only when **both** eyes see somebody within 10 cm.
+- `enter_follow` is true when the nearest reading is within 30 cm; `keep_follow`
+  when it is within 40 cm ("nothing seen" counts as false).
+- From `Idle`: both eyes within 10 cm -> start `Action` and set the count to 200;
+  else nearest within 30 cm -> `Follow`; else stay `Idle`.
+- In `Follow`: a very close person wins and starts `Action`; otherwise stay
+  `Follow` until the nearest reading goes past 40 cm, then `Idle`. Because the
+  entry (30) and exit (40) are different, a reading hovering around 30 does not
+  flicker.
+- In `Action` the song plays: each tick the count goes down, and when it reaches
+  zero the mood moves to `PostAction`.
+- In `PostAction`: while both eyes still see somebody within 10 cm, stay here (so
+  the song does **not** restart); once they step out, `Follow` them or go back to
+  `Idle`.
 - The chosen mood is stored in `self.state` and also returned.
 
 ### 4.9 The tests
@@ -440,9 +519,10 @@ mod tests {
   the test fails.
 - This test says: with no readings, the mood must be `Idle`.
 
-The other tests work the same way and check: far away -> `Idle`, 80 cm ->
-`Follow`, 20 cm -> `Action`, stepping back goes to `Follow`, leaving goes to
-`Idle`, and that `direction()` picks the correct side.
+The other tests work the same way and check: far away -> `Idle`, 50 cm ->
+`Follow`, both eyes close -> `Action`, the song plays for its ticks and then
+becomes `PostAction`, `PostAction` waits until the person leaves, and that
+`direction()` picks the correct side.
 
 ## 5. `src/lib/sensor.rs` — the eyes
 
@@ -639,17 +719,23 @@ const MAX_PULSE_US: u32 = 2_500;
 pub struct Head<Pwm> {
     pwm: Pwm,
     max_duty: u16,
+    angle: Option<u8>,
 }
 
 impl<Pwm: SetDutyCycle> Head<Pwm> {
     pub fn new(pwm: Pwm) -> Self {
         let max_duty = pwm.max_duty_cycle();
-        Self { pwm, max_duty }
+        Self {
+            pwm,
+            max_duty,
+            angle: None,
+        }
     }
 ```
 
-- `Head<Pwm>` holds the PWM signal and the biggest number it can accept
-  (`max_duty`).
+- `Head<Pwm>` holds the PWM signal, the biggest number it can accept
+  (`max_duty`), and the angle it was last commanded to (`None` before the first
+  command).
 - `new()` asks the PWM pin its maximum (`max_duty_cycle()`), then stores both.
 
 ### 6.3 `set_angle()` — turn to an angle
@@ -657,19 +743,25 @@ impl<Pwm: SetDutyCycle> Head<Pwm> {
 ```rust
     pub fn set_angle(&mut self, degrees: u8) -> Result<(), Pwm::Error> {
         let degrees = degrees.clamp(MIN_ANGLE, MAX_ANGLE);
+        if self.angle == Some(degrees) {
+            return Ok(());
+        }
         let pulse_us = MIN_PULSE_US
             + (u32::from(degrees) * (MAX_PULSE_US - MIN_PULSE_US)) / u32::from(MAX_ANGLE);
         let duty = (u32::from(self.max_duty) * pulse_us / PERIOD_US) as u16;
-        self.pwm.set_duty_cycle(duty)
+        self.pwm.set_duty_cycle(duty)?;
+        self.angle = Some(degrees);
+        Ok(())
     }
 ```
 
 - `clamp(0, 180)` keeps the angle inside the safe range, even if someone asks
   for something silly.
-- The next line turns the angle into a pulse length: at 0 degrees it is 500,
-  at 180 degrees it is 2500.
-- Then it turns the pulse into the number the Pico understands (`duty`) and
-  sends it with `set_duty_cycle`.
+- If the servo is already at `degrees`, the function returns straight away and
+  leaves the pulse width alone: a steady head does not twitch (`trapano`).
+- Otherwise it turns the angle into a pulse length (500 at 0 degrees, 2500 at
+  180), turns the pulse into the number the Pico understands (`duty`), sends it
+  with `set_duty_cycle`, and remembers the new angle.
 
 ```rust
     pub fn center(&mut self) -> Result<(), Pwm::Error> {
@@ -830,18 +922,20 @@ mod tests {
   call mine".
 
 ```rust
-use defmt::info;
-use defmt_rtt as _;
 use panic_halt as _;
 
 use cortex_m::delay::Delay;
 use cortex_m_rt::entry;
 use rp_pico as bsp;
+
+use usb_device::class_prelude::UsbBusAllocator;
+use usb_device::prelude::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
+use usbd_serial::SerialPort;
 ```
 
-- `use defmt::info;` brings in the log macro `info!`.
-- `use defmt_rtt as _;` and `use panic_halt as _;` turn on two helpers by just
-  importing them (the `_` means "we do not need a name").
+- `use panic_halt as _;` turns on the "stop safely" helper by just importing it
+  (the `_` means "we do not need a name").
+- `usb-device` + `usbd-serial` bring in the USB serial port used for logs.
 - `Delay` lets us wait; `entry` marks the program's start; `rp_pico` gives us
   the Pico's parts, nicknamed `bsp` ("board support package").
 
@@ -1002,13 +1096,13 @@ fn main() -> ! {
 
 ```rust
     let mut machine = StateMachine::new();
-    info!("scary monster ready");
 
     loop {
 ```
 
 - `machine` is the brain's mood machine, starting in `Idle`.
-- `info!("...")` prints a log message (you see it with `make logs`).
+- Log messages are written to the USB serial port and you read them with
+  `make logs`.
 - `loop {` starts the endless repeat.
 
 ```rust
@@ -1031,34 +1125,33 @@ fn main() -> ! {
 - Ask the brain for the new mood.
 
 ```rust
-        match state {
-            State::Idle => {
-                head.center().ok();
-            }
-            State::Follow => {
-                let angle = match reading.direction() {
+        if commanded != Some(state) {
+            commanded = Some(state);
+            let desired = match state {
+                State::Follow => match reading.direction() {
                     Direction::Left => TURN_LEFT_ANGLE,
                     Direction::Center => TURN_CENTER_ANGLE,
                     Direction::Right => TURN_RIGHT_ANGLE,
-                };
-                head.set_angle(angle).ok();
-            }
-            State::Action => {
-                head.set_angle(TURN_CENTER_ANGLE).ok();
-                if previous != State::Action {
-                    info!("person close: playing track {}", FIRST_TRACK);
-                    audio.play_track(FIRST_TRACK).ok();
-                }
-            }
+                },
+                _ => TURN_CENTER_ANGLE,
+            };
+            head.set_angle(desired).ok();
+            servo_moved = true;
+        }
+
+        if state == State::Action && previous != State::Action {
+            audio.play_track(FIRST_TRACK).ok();
         }
 ```
 
-- `match state` chooses what to do for each mood:
-  - `Idle`: look straight ahead.
-  - `Follow`: look left, centre, or right, based on `reading.direction()`.
-  - `Action`: look centre, and **if we were not already in Action**, play the
-    song. The `if previous != State::Action` check is what stops the song from
-    restarting every loop.
+- The wanted angle is the side to look at in `Follow`, and the centre otherwise.
+- The head is moved **only when the mood changes**: `commanded` remembers the
+  mood it was last positioned for, and a steady mood leaves the head untouched.
+  The first time it moves to the centre.
+- `Action` centres the head and plays the song once, **if we were not already in
+  `Action`** (`previous != State::Action`).
+- When the head actually moves, `servo_moved` marks the log row, so the servo
+  column shows `90 deg *`.
 - `.ok()` on the head and audio calls means "ignore a small failure and keep
   going".
 

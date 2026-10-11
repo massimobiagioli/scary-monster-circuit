@@ -1,17 +1,32 @@
 //! Behavior finite state machine.
 //!
-//! The prop has exactly three states. The next state is a pure function of the
-//! nearest distance reported by the two side sensors, which keeps the logic
-//! small and easy to test.
+//! The prop has four states. Apart from `Action`, which lasts a fixed number of
+//! ticks so the scary song can finish, the next state is a function of the two
+//! side sensors. This keeps the logic small and easy to test.
 
-/// Distance (cm) below which the head starts following a person.
-pub const FOLLOW_DISTANCE_CM: u16 = 100;
+/// Distance (cm) below which `Follow` starts: the nearest sensor must see
+/// somebody this close (one sensor is enough).
+pub const FOLLOW_DISTANCE_CM: u16 = 30;
 
-/// Distance (cm) below which the scary song is triggered.
-pub const ACTION_DISTANCE_CM: u16 = 30;
+/// Distance (cm) above which `Follow` is left again (nearest sensor).
+///
+/// The gap between this and [`FOLLOW_DISTANCE_CM`] is hysteresis: a reading
+/// that wobbles around 30 cm does not flicker the state (and the head) on and
+/// off.
+pub const FOLLOW_EXIT_CM: u16 = 40;
+
+/// Distance (cm) below which `Action` triggers: **both** sensors must see
+/// somebody this close, so the song only starts for a person right in front.
+pub const ACTION_DISTANCE_CM: u16 = 10;
 
 /// Minimum difference (cm) between the two sensors before the head turns.
 pub const TURN_DEADBAND_CM: u16 = 10;
+
+/// How long `Action` lasts before moving on: about the length of the song.
+///
+/// The main loop calls [`StateMachine::update`] roughly every 50 ms, so 200
+/// ticks is about 10 seconds.
+pub const ACTION_DURATION_TICKS: u32 = 200;
 
 /// What the prop is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,10 +34,13 @@ pub enum State {
     /// Waiting; nothing is within range.
     #[default]
     Idle,
-    /// A person is within `FOLLOW_DISTANCE_CM`; follow their movement.
+    /// The nearest person is within `FOLLOW_DISTANCE_CM`; follow their movement.
     Follow,
-    /// A person is within `ACTION_DISTANCE_CM`; play the scary song.
+    /// Both sensors see somebody within `ACTION_DISTANCE_CM`; play the song.
     Action,
+    /// The song has played; follow the person but do not trigger again until
+    /// they leave the action range.
+    PostAction,
 }
 
 /// Which way the head should turn to face the closest person.
@@ -41,6 +59,14 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// Whether both sensors see something within `cm` centimetres.
+    pub fn both_within(&self, cm: u16) -> bool {
+        matches!(
+            (self.left_cm, self.right_cm),
+            (Some(left), Some(right)) if left <= cm && right <= cm
+        )
+    }
+
     /// The smallest valid distance across both sensors.
     pub fn nearest_cm(&self) -> Option<u16> {
         match (self.left_cm, self.right_cm) {
@@ -74,6 +100,7 @@ impl Reading {
 #[derive(Debug, Default)]
 pub struct StateMachine {
     state: State,
+    action_ticks: u32,
 }
 
 impl StateMachine {
@@ -89,10 +116,49 @@ impl StateMachine {
 
     /// Advances the machine with a new sensor reading and returns the state.
     pub fn update(&mut self, reading: Reading) -> State {
-        self.state = match reading.nearest_cm() {
-            Some(distance) if distance <= ACTION_DISTANCE_CM => State::Action,
-            Some(distance) if distance <= FOLLOW_DISTANCE_CM => State::Follow,
-            _ => State::Idle,
+        let nearest = reading.nearest_cm();
+        let within_action = reading.both_within(ACTION_DISTANCE_CM);
+        let enter_follow = nearest.is_some_and(|distance| distance <= FOLLOW_DISTANCE_CM);
+        let keep_follow = nearest.is_some_and(|distance| distance <= FOLLOW_EXIT_CM);
+
+        self.state = match self.state {
+            State::Action => {
+                self.action_ticks = self.action_ticks.saturating_sub(1);
+                if self.action_ticks == 0 {
+                    State::PostAction
+                } else {
+                    State::Action
+                }
+            }
+            State::PostAction => {
+                if within_action {
+                    State::PostAction
+                } else if keep_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
+            State::Follow => {
+                if within_action {
+                    self.action_ticks = ACTION_DURATION_TICKS;
+                    State::Action
+                } else if keep_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
+            State::Idle => {
+                if within_action {
+                    self.action_ticks = ACTION_DURATION_TICKS;
+                    State::Action
+                } else if enter_follow {
+                    State::Follow
+                } else {
+                    State::Idle
+                }
+            }
         };
         self.state
     }
@@ -119,29 +185,84 @@ mod tests {
     }
 
     #[test]
-    fn follows_a_person_within_follow_distance() {
+    fn follows_when_one_sensor_sees_somebody_within_follow_distance() {
         let mut machine = StateMachine::new();
-        assert_eq!(machine.update(reading(Some(80), None)), State::Follow);
+        assert_eq!(machine.update(reading(Some(20), None)), State::Follow);
     }
 
     #[test]
-    fn acts_when_person_is_very_close() {
+    fn keeps_follow_until_the_exit_distance() {
         let mut machine = StateMachine::new();
-        assert_eq!(machine.update(reading(Some(20), Some(200))), State::Action);
+        assert_eq!(machine.update(reading(Some(20), Some(25))), State::Follow);
+
+        // Just past the entry threshold: still following (hysteresis).
+        assert_eq!(machine.update(reading(Some(35), Some(35))), State::Follow);
+        // Past the exit threshold: idle.
+        assert_eq!(
+            machine.update(reading(
+                Some(FOLLOW_EXIT_CM + 1),
+                Some(FOLLOW_EXIT_CM + 1)
+            )),
+            State::Idle
+        );
     }
 
     #[test]
-    fn returns_to_follow_when_person_steps_back() {
+    fn acts_only_when_both_sensors_see_somebody_close() {
         let mut machine = StateMachine::new();
-        machine.update(reading(Some(20), None));
-        assert_eq!(machine.update(reading(Some(70), None)), State::Follow);
+        assert_eq!(machine.update(reading(Some(5), Some(8))), State::Action);
+
+        let mut machine = StateMachine::new();
+        assert_eq!(machine.update(reading(Some(5), Some(200))), State::Follow);
     }
 
     #[test]
-    fn returns_to_idle_when_person_leaves() {
+    fn keeps_action_while_the_song_plays() {
         let mut machine = StateMachine::new();
-        machine.update(reading(Some(20), None));
-        assert_eq!(machine.update(reading(Some(400), Some(400))), State::Idle);
+        machine.update(reading(Some(5), Some(8)));
+
+        // Stepping back out of the action range does not stop the song.
+        assert_eq!(machine.update(reading(Some(70), Some(80))), State::Action);
+    }
+
+    #[test]
+    fn enters_post_action_when_the_song_ends() {
+        let mut machine = StateMachine::new();
+        machine.update(reading(Some(5), Some(8)));
+
+        for _ in 0..ACTION_DURATION_TICKS {
+            machine.update(reading(Some(5), Some(8)));
+        }
+
+        assert_eq!(machine.state(), State::PostAction);
+    }
+
+    #[test]
+    fn post_action_waits_until_the_person_leaves() {
+        let mut machine = StateMachine::new();
+        machine.update(reading(Some(5), Some(8)));
+        for _ in 0..ACTION_DURATION_TICKS {
+            machine.update(reading(Some(5), Some(8)));
+        }
+
+        // Still in front: stay in post-action and do not replay.
+        assert_eq!(machine.update(reading(Some(6), Some(9))), State::PostAction);
+        // Out of the action range: back to following.
+        assert_eq!(machine.update(reading(Some(20), Some(25))), State::Follow);
+        // Gone entirely: idle.
+        assert_eq!(machine.update(reading(Some(300), Some(300))), State::Idle);
+    }
+
+    #[test]
+    fn post_action_rearms_when_the_person_returns() {
+        let mut machine = StateMachine::new();
+        machine.update(reading(Some(5), Some(8)));
+        for _ in 0..ACTION_DURATION_TICKS {
+            machine.update(reading(Some(5), Some(8)));
+        }
+
+        assert_eq!(machine.update(reading(Some(20), Some(25))), State::Follow);
+        assert_eq!(machine.update(reading(Some(5), Some(8))), State::Action);
     }
 
     #[test]
@@ -172,11 +293,16 @@ mod tests {
         let mut machine = StateMachine::new();
 
         assert_eq!(
-            machine.update(reading(Some(FOLLOW_DISTANCE_CM), None)),
+            machine.update(reading(Some(FOLLOW_DISTANCE_CM), Some(FOLLOW_DISTANCE_CM))),
             State::Follow
         );
         assert_eq!(
-            machine.update(reading(Some(FOLLOW_DISTANCE_CM + 1), None)),
+            machine.update(reading(Some(FOLLOW_EXIT_CM), Some(FOLLOW_EXIT_CM))),
+            State::Follow,
+            "hysteresis keeps following"
+        );
+        assert_eq!(
+            machine.update(reading(Some(FOLLOW_EXIT_CM + 1), Some(FOLLOW_EXIT_CM + 1))),
             State::Idle
         );
     }
@@ -186,11 +312,13 @@ mod tests {
         let mut machine = StateMachine::new();
 
         assert_eq!(
-            machine.update(reading(Some(ACTION_DISTANCE_CM), None)),
+            machine.update(reading(Some(ACTION_DISTANCE_CM), Some(ACTION_DISTANCE_CM))),
             State::Action
         );
+
+        let mut machine = StateMachine::new();
         assert_eq!(
-            machine.update(reading(Some(ACTION_DISTANCE_CM + 1), None)),
+            machine.update(reading(Some(ACTION_DISTANCE_CM + 1), Some(ACTION_DISTANCE_CM))),
             State::Follow
         );
     }
@@ -221,11 +349,11 @@ mod tests {
     }
 
     #[test]
-    fn one_sensor_alone_decides_the_direction() {
+    fn one_sensor_alone_still_starts_following() {
         let mut machine = StateMachine::new();
 
-        assert_eq!(machine.update(reading(Some(80), None)), State::Follow);
-        assert_eq!(machine.update(reading(None, Some(80))), State::Follow);
+        assert_eq!(machine.update(reading(Some(20), None)), State::Follow);
+        assert_eq!(machine.update(reading(None, Some(20))), State::Follow);
         assert_eq!(machine.update(reading(None, None)), State::Idle);
     }
 }

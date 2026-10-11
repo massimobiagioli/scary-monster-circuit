@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run a project-local, version-pinned probe-rs.
+#
+# On first use it installs the pinned version (see version.txt) into a local
+# root, tools/probe-rs/.cargo-home, so nothing is installed globally and the
+# flashing tool is reproducible. Mirrors the tools/md2pdf and tools/breadboard
+# wrappers, which keep their dependencies in a local .venv.
+#
+# Usage: tools/probe-rs/probe-rs <probe-rs args...>
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$DIR/.cargo-home"
+BIN="$ROOT/bin/probe-rs"
+VERSION="$(cat "$DIR/version.txt")"
+CARGO="${CARGO:-cargo}"
+
+if [ ! -x "$BIN" ]; then
+    echo "installing probe-rs $VERSION into $ROOT" >&2
+    "$CARGO" install --locked --version "$VERSION" --root "$ROOT" probe-rs-tools
+fi
+
+exec "$BIN" "$@"
